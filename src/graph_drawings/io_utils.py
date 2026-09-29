@@ -10,22 +10,7 @@ from . import config
 
 
 def ensure_project_dirs() -> None:
-    for path in [
-        config.PROJECT_ROOT / "src",
-        config.PROJECT_ROOT / "scripts",
-        config.PROJECT_ROOT / "slurm",
-        config.PROJECT_ROOT / "docs",
-        config.PROJECT_ROOT / "archive",
-        config.SHARED_ROOT / "inputs",
-        config.SHARED_ROOT / "manifests",
-        config.SHARED_ROOT / "reference",
-        config.RESULTS_ROOT / "logs",
-        config.RESULTS_ROOT / "outputs",
-        config.RESULTS_ROOT / "merged",
-        config.RESULTS_ROOT / "debug",
-        config.RESULTS_ROOT / "runs",
-        config.SCRATCH_ROOT,
-    ]:
+    for path in [config.RUNS_ROOT, config.SCRATCH_ROOT]:
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -66,4 +51,3 @@ def clear_live_db_path(run_id: str) -> None:
     marker = live_db_path_file(run_id)
     if marker.exists():
         marker.unlink()
-

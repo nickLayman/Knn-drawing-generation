@@ -1,8 +1,4 @@
-"""Config for graph-drawings.
-
-Edit the graph and worker settings below before launching a run. Runtime paths
-come from the actual deployment source tree.
-"""
+"""Runtime and algorithm settings for the portable census program."""
 
 from __future__ import annotations
 
@@ -11,76 +7,30 @@ from pathlib import Path
 import sys
 
 
-PROJECT = "graph-drawings"
-RUN_ID = None  # Use None for GRAPH_NAME-YYYYMMDD-HHMMSS.
-
-_SITE_ROOTS = {
-    "office": Path("/home/nlayman/research"),
-    "head": Path("/srv/cluster"),
-    "nova": Path("/lustre/hdd/LAS/lidicky-lab/nlayman"),
-}
-_SITE_SCRATCH_ROOTS = {
-    "office": Path("/scratch/nlayman/projects") / PROJECT,
-    "head": Path("/scratch/nlayman/projects") / PROJECT,
-}
-
-
-def _project_root_for_site(site: str) -> Path:
-    return _SITE_ROOTS[site] / "projects" / PROJECT
-
-
-def detect_runtime_target(project_root: Path) -> str:
-    """Return the deployment site represented by an actual source tree."""
-
-    candidate = Path(project_root).resolve()
-    for site in _SITE_ROOTS:
-        if candidate == _project_root_for_site(site).resolve():
-            return site
-    expected = ", ".join(str(_project_root_for_site(site)) for site in _SITE_ROOTS)
-    raise RuntimeError(
-        f"unrecognized {PROJECT} source root {candidate}; expected one of: {expected}"
-    )
-
-
-def _nova_scratch_root(environment: dict[str, str] | None = None) -> Path:
-    env = os.environ if environment is None else environment
-    tmpdir = env.get("TMPDIR")
-    if tmpdir:
-        return Path(tmpdir) / PROJECT
-    return Path("/ptmp/lidicky-lab/nlayman") / PROJECT
-
-
-_SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_TARGET = detect_runtime_target(_SOURCE_PROJECT_ROOT)
-PROJECT_ROOT = _SOURCE_PROJECT_ROOT
-SHARED_ROOT = _SITE_ROOTS[RUNTIME_TARGET] / "shared" / PROJECT
-RESULTS_ROOT = _SITE_ROOTS[RUNTIME_TARGET] / "data" / PROJECT
-SCRATCH_ROOT = (
-    _nova_scratch_root()
-    if RUNTIME_TARGET == "nova"
-    else _SITE_SCRATCH_ROOTS[RUNTIME_TARGET]
-)
-
-
-def _python_bin() -> Path:
-    configured = os.environ.get("GD_PYTHON_BIN")
-    if configured:
-        path = Path(configured)
-        if not path.is_absolute():
-            raise RuntimeError("GD_PYTHON_BIN must be an absolute interpreter path")
-        return path
-    if RUNTIME_TARGET == "office":
-        return Path("/home/nlayman/miniconda3/envs/research/bin/python")
-    # Deployment environments are site-specific; use the interpreter that
-    # loaded this source tree instead of inventing a machine-local path.
-    return Path(sys.executable)
-
-
-PYTHON_BIN = _python_bin()
-
+PROJECT = "complete-bipartite-drawing-census"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_TARGET = "portable"
+PYTHON_BIN = Path(sys.executable).resolve()
 SRC_ROOT = PROJECT_ROOT / "src"
-RUNS_ROOT = RESULTS_ROOT / "runs"
-CURRENT_RUN_FILE = SHARED_ROOT / "manifests" / "current_run_id.txt"
+
+# The command line configures these paths before starting or resuming a run.
+# Defaults keep direct module use confined to the current working directory.
+RESULTS_ROOT = Path.cwd() / "results"
+RUNS_ROOT = RESULTS_ROOT
+SCRATCH_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / PROJECT
+SHARED_ROOT = RESULTS_ROOT
+CURRENT_RUN_FILE = RESULTS_ROOT / ".current_run_id"
+
+
+def configure_runtime(*, runs_root: Path, scratch_root: Path) -> None:
+    """Set the explicit output and scratch roots used by this process."""
+
+    global RESULTS_ROOT, RUNS_ROOT, SCRATCH_ROOT, SHARED_ROOT, CURRENT_RUN_FILE
+    RUNS_ROOT = Path(runs_root).resolve()
+    RESULTS_ROOT = RUNS_ROOT
+    SCRATCH_ROOT = Path(scratch_root).resolve()
+    SHARED_ROOT = RUNS_ROOT
+    CURRENT_RUN_FILE = RUNS_ROOT / ".current_run_id"
 
 # Default target. Vertices are inferred from GRAPH_EDGES; disconnected graphs
 # are intentionally unsupported.
@@ -94,20 +44,9 @@ EXPORT_VERTEX_COLORS = [1, 1, 1, 2, 2, 2, 2, 2]  # Optional list, e.g. [1, 2, 2,
 FINAL_OUTPUT_MODE = "full_drawings"  # "full_drawings", "crossing_pair_flags", or "four_graph_flags".
 FINAL_FLAG_CANONICALIZATION = "none"  # Reserved for future use; current final flag dedupe is exact-string only.
 
-# K4,3 has seven vertices.  Larger production enumerations are Nova-compute
-# work; the existing distributed Nova dispatch is intentionally not assumed to
-# be configured by this source tree.
-K43_VERTEX_COUNT = 7
-
-
 def graph_vertex_count(edges=None) -> int:
     configured_edges = GRAPH_EDGES if edges is None else edges
     return len({int(vertex) for edge in configured_edges for vertex in edge})
-
-
-def graph_requires_nova(edges=None) -> bool:
-    configured_edges = GRAPH_EDGES if edges is None else edges
-    return graph_vertex_count(configured_edges) > K43_VERTEX_COUNT or len(configured_edges) > 12
 
 
 def validate_entrypoint_runtime(
@@ -119,36 +58,14 @@ def validate_entrypoint_runtime(
     environment: dict[str, str] | None = None,
     edges=None,
 ) -> None:
-    """Reject production launches on a site or node that cannot run them."""
+    """Validate portable entry-point arguments at the external boundary."""
 
-    target = RUNTIME_TARGET if runtime_target is None else runtime_target
-    if target not in _SITE_ROOTS:
-        raise RuntimeError(f"{operation}: unsupported runtime target {target!r}")
-
+    del operation, require_compute_node, runtime_target, environment
     configured_edges = GRAPH_EDGES if edges is None else edges
-    vertex_count = graph_vertex_count(configured_edges)
-    edge_count = len(configured_edges)
-    if target == "nova" and worker_count:
-        raise RuntimeError(
-            f"{operation}: Nova distributed Slurm dispatch is not configured for "
-            "this project; use the allocation-local runner on a Nova compute node"
-        )
-    if not graph_requires_nova(configured_edges):
-        return
-
-    if target != "nova":
-        raise RuntimeError(
-            f"{operation}: graph has {vertex_count} vertices and {edge_count} edges "
-            "(larger than the K4,3 boundary); large enumerations must run on Nova compute, "
-            f"not {target}"
-        )
-
-    env = os.environ if environment is None else environment
-    if require_compute_node and not env.get("SLURM_JOB_ID"):
-        raise RuntimeError(
-            f"{operation}: graph has {vertex_count} vertices and must run on a "
-            "Nova compute allocation (SLURM_JOB_ID is unset)"
-        )
+    if not configured_edges:
+        raise ValueError("the graph must contain at least one edge")
+    if worker_count is not None and worker_count < 0:
+        raise ValueError("worker_count cannot be negative")
 
 # Cluster/local mode:
 #   WORKER_COUNT > 0: submit Slurm coordinator + worker array.

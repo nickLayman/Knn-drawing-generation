@@ -102,8 +102,12 @@ def side_swap_analysis(
     size = len(a_vertices)
     if size != len(b_vertices):
         return False, False
-    if size < 3:
-        raise ValueError("crossing-order side-swap testing requires equal parts of size at least 3")
+    if size == 2:
+        # The two hard-coded K(2,2) sphere drawings (zero or one crossing) are
+        # each fixed by an interchange of the two bipartition classes.
+        return True, True
+    if size < 2:
+        raise ValueError("side-swap testing requires equal parts of size at least 2")
     orders = drawing_crossing_orders(drawing, a_vertices, b_vertices)
     lengths = tuple(len(order) for order in orders)
     a_profiles = tuple(

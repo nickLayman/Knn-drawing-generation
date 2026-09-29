@@ -36,6 +36,12 @@ class CompleteBipartiteCensusTests(unittest.TestCase):
         self.assertEqual(orders[3], (1,))
         self.assertTrue(has_side_swapping_strong_automorphism(drawing, (0, 1, 2), (3, 4, 5)))
 
+    def test_both_k22_base_drawings_are_fixed_by_a_side_swap(self):
+        from graph_drawings.build_plan import base_drawings_for_cycle
+
+        for drawing in base_drawings_for_cycle((0, 2, 1, 3)):
+            self.assertTrue(has_side_swapping_strong_automorphism(drawing, (0, 1), (2, 3)))
+
     def test_flag_bucket_respects_color_permutations(self):
         original = "6 0 1 1 1 2 2 2 2 1423 1526"
         relabeled_within_colors = "6 0 1 1 1 2 2 2 2 2513 2614"

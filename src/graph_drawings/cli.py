@@ -2,9 +2,9 @@
 """Generate and measure a complete-bipartite drawing and flag census.
 
 The drawing stage is the existing planarization-based graph-drawings pipeline.
-This driver adds resumable export, square-case side-swap accounting, and exact
-parallel flag.cpp reductions for crossing-pair and 4-graph flags under both
-color conventions.
+This driver adds resumable export, square-case side-swap accounting, and
+optional exact parallel flag.cpp reductions for crossing-pair and 4-graph
+flags under both color conventions.
 """
 
 from __future__ import annotations
@@ -25,14 +25,18 @@ import sys
 import tempfile
 import time
 
-SRC = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(SRC))
-
-from graph_drawings import config
+from graph_drawings import __version__, config
 from graph_drawings.automorphism import build_block_to_record, context_to_record, make_canonical_context
 from graph_drawings.build_plan import base_drawings_for_cycle, derive_build_blocks, derive_build_plan
 from graph_drawings.canonical import HASH_ALGORITHM, drawing_keys
-from graph_drawings.compact import CompactContext, compress_db_blob, context_from_run_config, decode_drawing, encode_drawing
+from graph_drawings.compact import (
+    CompactContext,
+    compress_db_blob,
+    context_from_run_config,
+    decode_drawing,
+    decompress_db_blob,
+    encode_drawing,
+)
 from graph_drawings.complete_bipartite_census import (
     bipartition,
     complete_bipartite_graph,
@@ -43,11 +47,18 @@ from graph_drawings.complete_bipartite_census import (
 )
 from graph_drawings.drawing import normalize_edge
 from graph_drawings.flag_formats import crossing_pair_flag, four_graph_flag
-from graph_drawings.io_utils import create_run_dir, make_run_id, write_json
+from graph_drawings.io_utils import create_run_dir, write_json
 from graph_drawings.local_runner import run_local
 from graph_drawings.serialization import drawing_summary
-from graph_drawings.shards import iter_reduced_shard
-from graph_drawings.status import connect_db, init_schema, insert_job, insert_reported_class, set_status
+from graph_drawings.shards import ShardRecord, iter_reduced_shard, write_reduced_shard
+from graph_drawings.status import (
+    connect_db,
+    init_schema,
+    insert_job,
+    insert_reported_class,
+    insert_shard_manifest,
+    set_status,
+)
 
 
 _EXPORT_RUN_CONFIG: dict | None = None
@@ -119,10 +130,7 @@ def git_revision(explicit: str | None = None) -> str:
         stderr=subprocess.PIPE,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            "source revision is unavailable; pass --source-revision when running "
-            "from a deployment without .git"
-        )
+        return f"package-{__version__}"
     return result.stdout.strip()
 
 
@@ -182,6 +190,37 @@ def initialize_run(run_id: str, m: int, n: int, workers: int, source_revision: s
                 work_hash=keys.work_hash,
                 compact_blob=compact_blob,
             )
+    if not blocks:
+        # K(2,2) is already complete at the hard-coded base. Materialize the
+        # same final-shard representation used after ordinary reduction stages.
+        relative_path = Path("shards/stage-0/reduced/base/base.gds.gz")
+        records = [
+            ShardRecord(
+                report_hash=row["report_hash"],
+                work_hash=row["work_hash"],
+                compact_payload=decompress_db_blob(row["compact_blob"]),
+            )
+            for row in db.execute(
+                """
+                SELECT report_hash, work_hash, compact_blob
+                FROM canonical_drawings
+                WHERE stage_index=0
+                ORDER BY report_hash
+                """
+            )
+        ]
+        byte_count = write_reduced_shard(run_dir / relative_path, records)
+        insert_shard_manifest(
+            db,
+            shard_path=str(relative_path),
+            stage_index=0,
+            bucket_hash="base",
+            kind="reduced",
+            source_job_key=None,
+            source_worker="census-init",
+            record_count=len(records),
+            byte_count=byte_count,
+        )
     set_status(db, "run_id", run_id)
     set_status(db, "graph_name", f"K{m}_{n}")
     set_status(db, "total_steps", str(len(blocks)))
@@ -249,8 +288,6 @@ def initialize_run(run_id: str, m: int, n: int, workers: int, source_revision: s
         "created_at": time.time(),
     }
     write_json(run_config_path, run_config)
-    config.CURRENT_RUN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    config.CURRENT_RUN_FILE.write_text(run_id + "\n", encoding="utf-8")
     return run_dir
 
 
@@ -813,9 +850,86 @@ def reduce_flags(
 
 def generation_diagnostics(run_dir: Path) -> dict:
     summary_path = run_dir / "outputs" / "final_run_summary.json"
-    if not summary_path.is_file():
+    if summary_path.is_file():
+        return load_json(summary_path)
+    run_config = load_json(run_dir / "run_config.json")
+    if int(run_config["total_steps"]) != 0:
         raise RuntimeError(f"drawing generation did not write {summary_path}")
-    return load_json(summary_path)
+    rows = final_shards(run_dir, 0)
+    summary = {
+        "graph_name": run_config["graph_name"],
+        "total_steps": 0,
+        "final_drawing_count": sum(int(row["record_count"]) for row in rows),
+        "shards_by_stage": [
+            {
+                "stage_index": 0,
+                "kind": "reduced",
+                "shard_count": len(rows),
+                "record_count": sum(int(row["record_count"]) for row in rows),
+                "byte_count": sum(int(row["byte_count"]) for row in rows),
+            }
+        ],
+        "worker_io_by_stage": [],
+        "worker_io_summary": {},
+        "note": "The complete graph is the hard-coded K(2,2) base; no extension stage was required.",
+    }
+    atomic_json(summary_path, summary)
+    return summary
+
+
+def write_export_report(
+    run_dir: Path,
+    m: int,
+    n: int,
+    export: dict,
+    generation: dict,
+    manifest: dict,
+) -> dict:
+    """Record the complete drawing census and unreduced flag exports."""
+
+    uncolored = int(export["drawing_count"])
+    fixed = int(export["fixed_by_side_swap"])
+    colored = uncolored if m != n else 2 * uncolored - fixed
+    summary = {
+        "schema_version": 1,
+        "graph": f"K({m},{n})",
+        "completed_at": utc_now(),
+        "strong_drawing_classes": {
+            "color_preserving": colored,
+            "color_blind": uncolored,
+            "side_swap_profile_candidates": export["side_swap_profile_candidates"],
+            "fixed_by_side_swap": fixed if m == n else None,
+        },
+        "flag_isomorphism_reduction": "not_requested",
+        "exported_labeled_flag_rows": {
+            "crossing_pair": int(export["crossing_rows"]),
+            "four_graph": int(export["four_rows"]),
+        },
+        "generation": generation,
+        "pipeline_stages": manifest.get("stages", {}),
+        "artifacts": {
+            "full_drawings": "final reduced compact shards listed in coordinator.sqlite",
+            "flag_exports": "census/export-shards",
+        },
+    }
+    atomic_json(run_dir / "census" / "summary.json", summary)
+    markdown = [
+        f"# Complete-bipartite census: K({m},{n})",
+        "",
+        "## Completed counts",
+        "",
+        f"- Strong drawing classes preserving the two color classes: {colored:,}",
+        f"- Strong drawing classes allowing a side swap: {uncolored:,}",
+        f"- Exported crossing-pair rows: {int(export['crossing_rows']):,}",
+        f"- Exported 4-graph rows: {int(export['four_rows']):,}",
+        "",
+        "The flag rows have not been reduced by isomorphism. To obtain flag-class counts, rerun this command with the same output directory and `--flag-cpp /path/to/flag.cpp`.",
+        "",
+        "Generation diagnostics and artifact paths are recorded in `summary.json` and `run.json`.",
+        "",
+    ]
+    (run_dir / "census" / "report.md").write_text("\n".join(markdown), encoding="utf-8")
+    return summary
 
 
 def write_report(
@@ -970,30 +1084,50 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("m", type=int)
     parser.add_argument("n", type=int)
-    parser.add_argument("--run-id")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--scratch-dir", type=Path)
     parser.add_argument("--workers", type=int, required=True)
-    parser.add_argument("--flag-cpp", type=Path, required=True)
+    parser.add_argument(
+        "--flag-cpp",
+        type=Path,
+        help="external Bernard Lidicky flag.cpp source used for exact isomorphism reduction",
+    )
     parser.add_argument("--source-revision")
     parser.add_argument("--sort-memory", default="25%")
     args = parser.parse_args()
     if args.m < 2 or args.n < 2:
         parser.error("m and n must both be at least 2")
-    if args.m + args.n > 9:
-        parser.error("flag.cpp text export currently supports at most nine vertices")
-    if args.m == args.n and args.m < 3:
-        parser.error("colored square counts currently require part size at least three")
+    if args.m > args.n:
+        parser.error("require m <= n so each complete bipartite graph has one canonical invocation")
+    if args.m + args.n > 8:
+        parser.error("this reproducibility package is limited to graphs on at most eight vertices")
     if args.workers < 1:
         parser.error("--workers must be positive")
-    args.flag_cpp = args.flag_cpp.resolve()
-    if not args.flag_cpp.is_file():
-        parser.error(f"flag.cpp not found: {args.flag_cpp}")
+    args.output_dir = args.output_dir.resolve()
+    if args.output_dir.name in {"", ".", ".."}:
+        parser.error("--output-dir must name a run directory")
+    if args.scratch_dir is None:
+        args.scratch_dir = Path(os.environ.get("TMPDIR", "/tmp")) / config.PROJECT / args.output_dir.name
+    args.scratch_dir = args.scratch_dir.resolve()
+    if args.flag_cpp is not None:
+        args.flag_cpp = args.flag_cpp.resolve()
+        if not args.flag_cpp.is_file():
+            parser.error(f"flag.cpp not found: {args.flag_cpp}")
+        if shutil.which("g++") is None:
+            parser.error("g++ is required when --flag-cpp is supplied")
+        if shutil.which("sort") is None:
+            parser.error("GNU sort is required when --flag-cpp is supplied")
     return args
 
 
 def main() -> None:
     args = parse_args()
+    config.configure_runtime(
+        runs_root=args.output_dir.parent,
+        scratch_root=args.scratch_dir,
+    )
     source_revision = git_revision(args.source_revision)
-    run_id = args.run_id or make_run_id(f"K{args.m}_{args.n}-census")
+    run_id = args.output_dir.name
     run_dir = initialize_run(run_id, args.m, args.n, args.workers, source_revision)
     census_dir = run_dir / "census"
     (census_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -1011,8 +1145,8 @@ def main() -> None:
                 "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
                 "workers": args.workers,
                 "sort_memory": args.sort_memory,
-                "flag_cpp": str(args.flag_cpp),
-                "flag_cpp_sha256": sha256(args.flag_cpp),
+                "flag_cpp": str(args.flag_cpp) if args.flag_cpp else None,
+                "flag_cpp_sha256": sha256(args.flag_cpp) if args.flag_cpp else None,
                 "source_revision": source_revision,
                 "command": [sys.executable, *sys.argv],
                 "stages": {},
@@ -1022,8 +1156,15 @@ def main() -> None:
     expected_graph = {"m": args.m, "n": args.n}
     if manifest.get("graph") != expected_graph:
         raise ValueError(f"existing census manifest is for {manifest.get('graph')}, not {expected_graph}")
-    if manifest.get("flag_cpp_sha256") != sha256(args.flag_cpp):
-        raise ValueError("flag.cpp changed since this census run was initialized")
+    if args.flag_cpp is not None:
+        supplied_hash = sha256(args.flag_cpp)
+        recorded_hash = manifest.get("flag_cpp_sha256")
+        if recorded_hash is not None and recorded_hash != supplied_hash:
+            raise ValueError("flag.cpp changed since this census run was initialized")
+        if recorded_hash is None:
+            manifest["flag_cpp"] = str(args.flag_cpp)
+            manifest["flag_cpp_sha256"] = supplied_hash
+            atomic_json(manifest_path, manifest)
 
     run_config = load_json(run_dir / "run_config.json")
     final_summary = run_dir / "outputs" / "final_run_summary.json"
@@ -1040,7 +1181,6 @@ def main() -> None:
     else:
         print("Drawing generation is already complete; resuming census postprocessing", flush=True)
 
-    scratch_root = Path(os.environ.get("TMPDIR", str(config.SCRATCH_ROOT))) / "census" / run_id
     export_summary_path = census_dir / "export-summary.json"
     if export_summary_path.is_file():
         export = load_json(export_summary_path)
@@ -1055,6 +1195,30 @@ def main() -> None:
             args.n,
             args.workers,
         )
+
+    if args.flag_cpp is None:
+        manifest = load_json(manifest_path)
+        summary = write_export_report(
+            run_dir,
+            args.m,
+            args.n,
+            export,
+            generation_diagnostics(run_dir),
+            manifest,
+        )
+        manifest.update(
+            {
+                "status": "complete_without_flag_reduction",
+                "completed_at": utc_now(),
+                "summary": "summary.json",
+            }
+        )
+        atomic_json(manifest_path, manifest)
+        print(json.dumps(summary["strong_drawing_classes"], sort_keys=True), flush=True)
+        print(f"Census report: {census_dir / 'report.md'}", flush=True)
+        return
+
+    scratch_root = config.SCRATCH_ROOT / "census" / run_id
 
     crossing_summary_path = census_dir / "crossing-summary.json"
     if crossing_summary_path.is_file():

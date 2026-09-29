@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "equivalence_columns": ["color_preserving", "color_blind"],
+  "graphs": {
+    "K(2,2)": {
+      "strong_drawing_classes": [2, 2],
+      "crossing_pair_flag_classes": [2, 2],
+      "four_graph_flag_classes": [2, 2]
+    },
+    "K(2,3)": {
+      "strong_drawing_classes": [6, 6],
+      "crossing_pair_flag_classes": [5, 5],
+      "four_graph_flag_classes": [4, 4]
+    },
+    "K(2,4)": {
+      "strong_drawing_classes": [40, 40],
+      "crossing_pair_flag_classes": [21, 21],
+      "four_graph_flag_classes": [11, 11]
+    },
+    "K(2,5)": {
+      "strong_drawing_classes": [394, 394],
+      "crossing_pair_flag_classes": [144, 144],
+      "four_graph_flag_classes": [33, 33]
+    },
+    "K(2,6)": {
+      "strong_drawing_classes": [5457, 5457],
+      "crossing_pair_flag_classes": [1697, 1697],
+      "four_graph_flag_classes": [144, 144]
+    },
+    "K(3,3)": {
+      "strong_drawing_classes": [177, 102],
+      "crossing_pair_flag_classes": [112, 70],
+      "four_graph_flag_classes": [18, 13]
+    },
+    "K(3,4)": {
+      "strong_drawing_classes": [14823, 14823],
+      "crossing_pair_flag_classes": [6393, 6393],
+      "four_graph_flag_classes": [355, 355]
+    },
+    "K(3,5)": {
+      "strong_drawing_classes": [2163813, 2163813],
+      "crossing_pair_flag_classes": [468742, 468742],
+      "four_graph_flag_classes": [17643, 17643]
+    },
+    "K(4,4)": {
+      "strong_drawing_classes": [18031850, 9019729],
+      "crossing_pair_flag_classes": [1931529, 967452],
+      "four_graph_flag_classes": [123926, 62415]
+    }
+  }
+}
