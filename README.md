@@ -166,3 +166,9 @@ workstation.
 The implementation was extracted from the enumerator used for the reported
 census. Exact source and run provenance are recorded in
 [`docs/provenance.md`](docs/provenance.md).
+
+## License
+
+This software is released under the [MIT License](LICENSE). Bernard Lidicky's
+private `flag.cpp` is a separate external dependency and is not covered by this
+repository's license.

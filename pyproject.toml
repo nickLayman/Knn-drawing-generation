@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Reproducible enumeration of good drawings of small complete bipartite graphs"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "Nick Layman"}]
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/nickLayman/Knn-drawing-generation"
+Issues = "https://github.com/nickLayman/Knn-drawing-generation/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
