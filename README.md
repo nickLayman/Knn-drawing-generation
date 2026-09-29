@@ -12,8 +12,10 @@ one to both flag representations used in the crossing-number calculation:
 - 4-graph flags record the four endpoints of each crossing pair.
 
 The conversion is included here. Exact reduction of those rows modulo flag
-isomorphism uses Bernard Lidicky's `flag.cpp`, which is an explicit external
-dependency and is not distributed in this repository.
+isomorphism uses Bernard Lidicky's private `flag.cpp`, which is an explicit
+external dependency and is not distributed in this repository. There is no
+public copy. Bernard may provide it to academic researchers who request it, at
+his discretion.
 
 ## Requirements
 
@@ -44,14 +46,17 @@ in-process deduplication sort holds the labeled flag rows in memory. It is
 therefore intended for cases such as `K(2,2)`, `K(2,3)`, and `K(3,3)`, rather
 than the largest census runs.
 
-The export-only serial path is supported on a current ordinary installation of
-macOS, Windows, or Linux with Python 3.12 or newer. Exact flag-isomorphism
-reduction remains optional and requires external `flag.cpp` plus a compatible
-C++ compiler. The current compiler command is `g++`; on macOS the Xcode command
-line tools normally provide a compatible Clang driver under that name. On
-Windows, use a `g++` supplied by MinGW-w64 or MSYS2. Native MSVC is not currently
-supported because `compile_reducer` in `src/graph_drawings/cli.py` constructs
-GNU-style compiler arguments.
+An attempt has been made to make the export-only serial path work on a current
+ordinary installation of macOS or Windows with Python 3.12 or newer. It has
+been exercised on Linux but has not been tested on either of those operating
+systems. macOS and Windows users should install the package, try the serial
+`K(2,3)` command below, and report any platform-specific failure. Exact
+flag-isomorphism reduction remains optional and requires private `flag.cpp`
+plus a compatible C++ compiler. The current compiler command is `g++`; on
+macOS the Xcode command line tools normally provide a compatible Clang driver
+under that name. On Windows, use a `g++` supplied by MinGW-w64 or MSYS2. Native
+MSVC is not currently supported because `compile_reducer` in
+`src/graph_drawings/cli.py` constructs GNU-style compiler arguments.
 
 `--workers N` is the Linux parallel mode used for the larger cases. Its Linux
 restriction comes from these locations:
@@ -130,8 +135,7 @@ bipartite-drawing-census 2 3 \
 ```
 
 The last command can be run after an export-only command. It resumes from the
-saved drawings and flag rows instead of regenerating them. The SHA-256 digest
-of `flag.cpp` is recorded in the run manifest.
+saved drawings and flag rows instead of regenerating them.
 
 Each run writes:
 
