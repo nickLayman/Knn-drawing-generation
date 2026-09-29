@@ -6,7 +6,6 @@ import argparse
 import base64
 import hashlib
 import json
-import resource
 import socket
 import socket as socket_module
 import sqlite3
@@ -30,6 +29,7 @@ from .extensions import apply_step_profiled, iter_final_route_crossings_profiled
 from .drawing import Crossing
 from .flag_formats import crossing_label_table, flag_vertex
 from .reducer import reduce_bucket
+from .resource_usage import process_max_rss_kib
 from .shards import (
     CompoundFlagRecord,
     CompoundRawRecord,
@@ -956,7 +956,7 @@ def process_job(job: dict, run_context: RunContext, shard_buffer: ShardBuffer | 
         profile["candidate_count"] = int(profile.get("checkpoint_candidates_before_local_reduce", len(candidates)))
     profile["elapsed_seconds"] = time.perf_counter() - start
     profile["worker_cpu_seconds"] = time.process_time() - cpu_start
-    profile["worker_max_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    profile["worker_max_rss_kib"] = process_max_rss_kib()
     return JobResult(
         job_key=job["job_key"],
         stage_index=stage_index,
@@ -999,7 +999,7 @@ def process_reduce_job(job: dict, run_context: RunContext) -> JobResult:
     elapsed = time.perf_counter() - start
     profile["elapsed_seconds"] = elapsed
     profile["worker_cpu_seconds"] = time.process_time() - cpu_start
-    profile["worker_max_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    profile["worker_max_rss_kib"] = process_max_rss_kib()
     return JobResult(
         job_key=job["job_key"],
         stage_index=stage_index,

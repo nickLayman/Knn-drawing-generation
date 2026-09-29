@@ -3,8 +3,8 @@
 
 The drawing stage is the existing planarization-based graph-drawings pipeline.
 This driver adds resumable export, square-case side-swap accounting, and
-optional exact parallel flag.cpp reductions for crossing-pair and 4-graph
-flags under both color conventions.
+optional exact flag.cpp reductions for crossing-pair and 4-graph flags under
+both color conventions.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-import resource
 import shutil
 import socket
 import subprocess
@@ -49,6 +48,8 @@ from graph_drawings.drawing import normalize_edge
 from graph_drawings.flag_formats import crossing_pair_flag, four_graph_flag
 from graph_drawings.io_utils import create_run_dir, write_json
 from graph_drawings.local_runner import run_local
+from graph_drawings.resource_usage import process_max_rss_kib, usage_snapshot
+from graph_drawings.serial_runner import run_serial
 from graph_drawings.serialization import drawing_summary
 from graph_drawings.shards import ShardRecord, iter_reduced_shard, write_reduced_shard
 from graph_drawings.status import (
@@ -85,19 +86,6 @@ def load_json(path: Path) -> dict:
     return value
 
 
-def usage_snapshot() -> dict:
-    self_usage = resource.getrusage(resource.RUSAGE_SELF)
-    child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return {
-        "self_user_seconds": self_usage.ru_utime,
-        "self_system_seconds": self_usage.ru_stime,
-        "children_user_seconds": child_usage.ru_utime,
-        "children_system_seconds": child_usage.ru_stime,
-        "self_max_rss_kib": self_usage.ru_maxrss,
-        "children_max_rss_kib": child_usage.ru_maxrss,
-    }
-
-
 def measured_call(function, *args, **kwargs):
     before = usage_snapshot()
     started = time.perf_counter()
@@ -121,14 +109,17 @@ def measured_call(function, *args, **kwargs):
 def git_revision(explicit: str | None = None) -> str:
     if explicit:
         return explicit
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=config.PROJECT_ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=config.PROJECT_ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return f"package-{__version__}"
     if result.returncode != 0:
         return f"package-{__version__}"
     return result.stdout.strip()
@@ -392,7 +383,6 @@ def export_shard(task: tuple[int, str, str]) -> dict:
                     four_rows += 1
     crossing_partial.replace(crossing_path)
     four_partial.replace(four_path)
-    worker_usage = resource.getrusage(resource.RUSAGE_SELF)
     result = {
         "shard_index": index,
         "source_path": str(source_path),
@@ -403,7 +393,7 @@ def export_shard(task: tuple[int, str, str]) -> dict:
         "four_rows": four_rows,
         "wall_seconds": time.perf_counter() - started,
         "cpu_seconds": time.process_time() - cpu_started,
-        "max_rss_kib": worker_usage.ru_maxrss,
+        "max_rss_kib": process_max_rss_kib(),
         "crossing_path": str(crossing_path),
         "four_path": str(four_path),
     }
@@ -417,6 +407,8 @@ def export_all_shards(
     m: int,
     n: int,
     workers: int,
+    *,
+    serial: bool = False,
 ) -> dict:
     rows = final_shards(run_dir, int(run_config["total_steps"]))
     output_root = run_dir / "census" / "export-shards"
@@ -424,20 +416,31 @@ def export_all_shards(
         (index, str(run_dir / row["shard_path"]), str(output_root))
         for index, row in enumerate(rows)
     ]
-    context = multiprocessing.get_context("fork")
     results = []
-    with context.Pool(
-        processes=min(workers, len(tasks)),
-        initializer=init_export_worker,
-        initargs=(run_config, m, n),
-    ) as pool:
-        for completed, result in enumerate(pool.imap_unordered(export_shard, tasks), start=1):
+    if serial:
+        init_export_worker(run_config, m, n)
+        result_iterator = map(export_shard, tasks)
+        for completed, result in enumerate(result_iterator, start=1):
             results.append(result)
             print(
                 f"exported final shard {completed}/{len(tasks)}: "
                 f"{result['drawing_count']:,} drawings",
                 flush=True,
             )
+    else:
+        context = multiprocessing.get_context("fork")
+        with context.Pool(
+            processes=min(workers, len(tasks)),
+            initializer=init_export_worker,
+            initargs=(run_config, m, n),
+        ) as pool:
+            for completed, result in enumerate(pool.imap_unordered(export_shard, tasks), start=1):
+                results.append(result)
+                print(
+                    f"exported final shard {completed}/{len(tasks)}: "
+                    f"{result['drawing_count']:,} drawings",
+                    flush=True,
+                )
     results.sort(key=lambda value: value["shard_index"])
     summary = {
         "shard_count": len(results),
@@ -487,6 +490,8 @@ def sort_fixed_rows(
     workers: int,
     sort_memory: str,
     scratch_root: Path,
+    *,
+    serial: bool = False,
 ) -> dict:
     output_dir = run_dir / "census" / "sorted"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -500,6 +505,30 @@ def sort_fixed_rows(
     scratch_root.mkdir(parents=True, exist_ok=True)
     partial = Path(f"{output_path}.partial")
     partial.unlink(missing_ok=True)
+    if serial:
+        started = time.perf_counter()
+        cpu_started = time.process_time()
+        rows = set()
+        for path in inputs:
+            with path.open("r", encoding="utf-8") as source:
+                rows.update(source)
+        with partial.open("x", encoding="utf-8") as output:
+            output.writelines(sorted(rows))
+        partial.replace(output_path)
+        result = {
+            "command": ["in-process-sort"],
+            "wall_seconds": time.perf_counter() - started,
+            "self_cpu_seconds": time.process_time() - cpu_started,
+            "children_cpu_seconds": 0.0,
+            "children_max_rss_kib": 0,
+            "input_shards": len(inputs),
+            "unique_labeled_rows": len(rows),
+            "output_path": str(output_path),
+            "output_bytes": output_path.stat().st_size,
+            "sha256": sha256(output_path),
+        }
+        atomic_json(marker_path, result)
+        return result
     environment = dict(os.environ)
     environment["LC_ALL"] = "C"
     command = [
@@ -701,7 +730,7 @@ def reduce_bucket(task: tuple[int, str, str, str, str, str]) -> dict:
     try:
         command = [str(binary), "-ffrd", str(input_path)]
         timed_command = command
-        if Path("/usr/bin/time").is_file():
+        if sys.platform.startswith("linux") and Path("/usr/bin/time").is_file():
             timed_command = ["/usr/bin/time", "-v", "-o", str(time_path), *command]
         with result_path.open("xb") as result:
             with stderr_path.open("w", encoding="utf-8") as errors:
@@ -770,6 +799,8 @@ def reduce_variant(
     bucket_dir: Path,
     workers: int,
     scratch_root: Path,
+    *,
+    serial: bool = False,
 ) -> dict:
     convention = "color-blind" if colors_blind else "color-preserving"
     binary = compile_reducer(run_dir, flag_cpp, kind, colors_blind)
@@ -788,16 +819,26 @@ def reduce_variant(
                 str(scratch_root),
             )
         )
-    context = multiprocessing.get_context("fork")
     results = []
-    with context.Pool(processes=min(workers, len(tasks))) as pool:
-        for completed, result in enumerate(pool.imap_unordered(reduce_bucket, tasks), start=1):
+    if serial:
+        result_iterator = map(reduce_bucket, tasks)
+        for completed, result in enumerate(result_iterator, start=1):
             results.append(result)
             print(
                 f"reduced {kind} {convention} bucket {completed}/{len(tasks)}: "
                 f"{result['class_count']:,} classes",
                 flush=True,
             )
+    else:
+        context = multiprocessing.get_context("fork")
+        with context.Pool(processes=min(workers, len(tasks))) as pool:
+            for completed, result in enumerate(pool.imap_unordered(reduce_bucket, tasks), start=1):
+                results.append(result)
+                print(
+                    f"reduced {kind} {convention} bucket {completed}/{len(tasks)}: "
+                    f"{result['class_count']:,} classes",
+                    flush=True,
+                )
     final_dir = run_dir / "census" / "flags"
     final_dir.mkdir(parents=True, exist_ok=True)
     return concatenate_reduced(
@@ -813,8 +854,17 @@ def reduce_flags(
     workers: int,
     sort_memory: str,
     scratch_root: Path,
+    *,
+    serial: bool = False,
 ) -> dict:
-    sorted_summary = sort_fixed_rows(run_dir, kind, workers, sort_memory, scratch_root)
+    sorted_summary = sort_fixed_rows(
+        run_dir,
+        kind,
+        workers,
+        sort_memory,
+        scratch_root,
+        serial=serial,
+    )
     fixed_bucket_dir = run_dir / "census" / "buckets" / f"{kind}-color-preserving"
     fixed_buckets = split_sorted_buckets(Path(sorted_summary["output_path"]), fixed_bucket_dir)
     fixed = reduce_variant(
@@ -826,6 +876,7 @@ def reduce_flags(
         fixed_bucket_dir,
         workers,
         scratch_root,
+        serial=serial,
     )
     blind_bucket_dir = run_dir / "census" / "buckets" / f"{kind}-color-blind"
     blind_buckets = split_blind_buckets(Path(fixed["output_path"]), blind_bucket_dir)
@@ -838,6 +889,7 @@ def reduce_flags(
         blind_bucket_dir,
         workers,
         scratch_root,
+        serial=serial,
     )
     return {
         "labeled": sorted_summary,
@@ -1086,7 +1138,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("n", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--scratch-dir", type=Path)
-    parser.add_argument("--workers", type=int, required=True)
+    execution = parser.add_mutually_exclusive_group(required=True)
+    execution.add_argument("--workers", type=int)
+    execution.add_argument(
+        "--serial",
+        action="store_true",
+        help="run the Python pipeline in one process without a coordinator server, sockets, or multiprocessing",
+    )
     parser.add_argument(
         "--flag-cpp",
         type=Path,
@@ -1101,13 +1159,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("require m <= n so each complete bipartite graph has one canonical invocation")
     if args.m + args.n > 8:
         parser.error("this reproducibility package is limited to graphs on at most eight vertices")
-    if args.workers < 1:
+    if args.workers is not None and args.workers < 1:
         parser.error("--workers must be positive")
+    if args.serial:
+        args.workers = 1
     args.output_dir = args.output_dir.resolve()
     if args.output_dir.name in {"", ".", ".."}:
         parser.error("--output-dir must name a run directory")
     if args.scratch_dir is None:
-        args.scratch_dir = Path(os.environ.get("TMPDIR", "/tmp")) / config.PROJECT / args.output_dir.name
+        args.scratch_dir = Path(os.environ.get("TMPDIR", tempfile.gettempdir())) / config.PROJECT / args.output_dir.name
     args.scratch_dir = args.scratch_dir.resolve()
     if args.flag_cpp is not None:
         args.flag_cpp = args.flag_cpp.resolve()
@@ -1115,7 +1175,7 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"flag.cpp not found: {args.flag_cpp}")
         if shutil.which("g++") is None:
             parser.error("g++ is required when --flag-cpp is supplied")
-        if shutil.which("sort") is None:
+        if not args.serial and shutil.which("sort") is None:
             parser.error("GNU sort is required when --flag-cpp is supplied")
     return args
 
@@ -1144,6 +1204,7 @@ def main() -> None:
                 "host": socket.gethostname(),
                 "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
                 "workers": args.workers,
+                "execution_mode": "serial" if args.serial else "parallel",
                 "sort_memory": args.sort_memory,
                 "flag_cpp": str(args.flag_cpp) if args.flag_cpp else None,
                 "flag_cpp_sha256": sha256(args.flag_cpp) if args.flag_cpp else None,
@@ -1169,15 +1230,25 @@ def main() -> None:
     run_config = load_json(run_dir / "run_config.json")
     final_summary = run_dir / "outputs" / "final_run_summary.json"
     if not final_summary.is_file():
-        print(f"Generating full strong drawings for K({args.m},{args.n}) with {args.workers} workers", flush=True)
-        record_stage(
-            manifest_path,
-            "drawing_generation",
-            run_local,
-            run_id,
-            int(run_config["total_steps"]),
-            process_count=args.workers,
-        )
+        if args.serial:
+            print(f"Generating full strong drawings for K({args.m},{args.n}) serially", flush=True)
+            record_stage(
+                manifest_path,
+                "drawing_generation",
+                run_serial,
+                run_id,
+                int(run_config["total_steps"]),
+            )
+        else:
+            print(f"Generating full strong drawings for K({args.m},{args.n}) with {args.workers} workers", flush=True)
+            record_stage(
+                manifest_path,
+                "drawing_generation",
+                run_local,
+                run_id,
+                int(run_config["total_steps"]),
+                process_count=args.workers,
+            )
     else:
         print("Drawing generation is already complete; resuming census postprocessing", flush=True)
 
@@ -1194,6 +1265,7 @@ def main() -> None:
             args.m,
             args.n,
             args.workers,
+            serial=args.serial,
         )
 
     if args.flag_cpp is None:
@@ -1234,6 +1306,7 @@ def main() -> None:
             args.workers,
             args.sort_memory,
             scratch_root,
+            serial=args.serial,
         )
         atomic_json(crossing_summary_path, crossing)
 
@@ -1251,6 +1324,7 @@ def main() -> None:
             args.workers,
             args.sort_memory,
             scratch_root,
+            serial=args.serial,
         )
         atomic_json(four_summary_path, four)
 

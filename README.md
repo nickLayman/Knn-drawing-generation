@@ -17,37 +17,56 @@ dependency and is not distributed in this repository.
 
 ## Requirements
 
-- Linux;
 - Python 3.12 or newer;
 - enough memory and storage for the selected graph;
-- optionally, GNU `sort`, `g++`, and a separate copy of `flag.cpp` for exact
-  flag-isomorphism reduction.
+- Linux for the parallel `--workers` mode;
+- optionally, a C++17 `g++` command and a separate copy of `flag.cpp` for exact
+  flag-isomorphism reduction. Parallel reduction also requires GNU `sort`.
 
 The drawing generator itself uses only the Python standard library.
 
-### Why Linux is currently required
+### Serial and parallel platform support
 
-Linux is a current implementation requirement rather than a mathematical one.
-The coordinator protocol, SQLite database, drawing representation, and flag
-formats are portable. The following operating-system assumptions still occur
-in the executable paths:
+`--serial` is the portable verification mode. It executes drawing extension,
+canonical reduction, drawing-to-flag conversion, and flag-reduction
+orchestration one operation at a time in the main Python process. It starts no
+coordinator server, opens no coordinator socket, creates no Python worker
+process, and does not use `multiprocessing`. If external `flag.cpp` reduction
+is requested, the compiler and each reducer binary are still launched as
+sequential subprocesses. The scratch-directory default comes from Python's
+platform-specific temporary directory. On Windows, CPU timing remains
+available but maximum-RSS fields are recorded as zero because the standard
+library has no corresponding process-memory interface.
 
-| Location | Current Linux assumption | Change needed on macOS | Change needed on Windows |
-|---|---|---|---|
-| `src/graph_drawings/local_runner.py`: `run_local`, `_run_coordinator`, and `_run_worker` | Child processes inherit the configured output and scratch roots. This follows Linux's `fork` behavior. | macOS uses `spawn` by default. Pass the runtime roots to both child entry points and call `config.configure_runtime` in each child, or create all processes from an explicitly initialized multiprocessing context. | Make the same spawn-safe change. Keep process creation behind the existing `if __name__ == "__main__"` entry point and add `multiprocessing.freeze_support()` if a frozen executable is distributed. |
-| `src/graph_drawings/cli.py`: `export_all_shards` and `reduce_variant` | Both pools explicitly request `multiprocessing.get_context("fork")`. | Replace `fork` with `spawn` and confirm that the existing export initializer supplies every worker global. The reduction tasks already carry their paths as arguments. | Make the same replacement; `fork` is unavailable on Windows. Test all pool arguments under Python's pickle rules. |
-| `src/graph_drawings/cli.py`: `usage_snapshot` and `export_shard`; `src/graph_drawings/worker.py`: the two `resource.getrusage` calls | Python's Unix-only `resource` module supplies process CPU time and maximum RSS. Linux reports `ru_maxrss` in KiB. | The module exists, but macOS reports `ru_maxrss` in bytes. Divide that value by 1024 before recording the fields named `*_kib`. | Replace these calls with a Windows-capable source such as `psutil`, or make RSS diagnostics optional and use `time.process_time()` for CPU time. Imports of `resource` must also become conditional. |
-| `src/graph_drawings/cli.py`: `sort_fixed_rows` | Exact flag reduction invokes GNU `sort` with `--parallel`, `-S`, `-T`, `-o`, and `LC_ALL=C`. | Install GNU coreutils and invoke `gsort`, adding a `--sort-command` option, or replace this step with a Python external merge sort. The BSD `sort` shipped with macOS does not accept the full command used here. | Supply GNU `sort` through MSYS2/MinGW and select it explicitly, or implement the external merge sort in Python. Windows `sort.exe` is not compatible. |
-| `src/graph_drawings/cli.py`: `reduce_bucket` and `parse_time_report` | If `/usr/bin/time` exists, the reducer uses GNU `time -v` and parses its verbose field names. | Do not select `/usr/bin/time` merely because the path exists: the macOS program has a different interface. Detect GNU time (commonly installed as `gtime`), add a configurable command, or omit these optional measurements. | Skip this wrapper or collect the same optional measurements through `psutil`; `/usr/bin/time` is normally absent. |
-| `src/graph_drawings/cli.py`: `compile_reducer` and `parse_args` | The external `flag.cpp` source is compiled with a hard-coded `g++ -O3 -std=c++17 ...` command. | Accept a `--cxx` command and use `clang++` or an installed `g++`; the remaining preprocessor definitions and source arguments can stay the same. | The shortest route is a MinGW/MSYS2 `g++`. Native MSVC support requires a separate `cl` command construction with equivalent optimization, C++17, preprocessor-definition, and output options. |
-| `src/graph_drawings/config.py`: the default `SCRATCH_ROOT`; `src/graph_drawings/cli.py`: the default for `--scratch-dir` | If `TMPDIR` is unset, scratch files fall back to `/tmp`. | `/tmp` normally exists, but using `tempfile.gettempdir()` would express the portable intent. | Replace the `/tmp` fallback with `tempfile.gettempdir()` so the default resolves to the user's Windows temporary directory. |
+This mode exists for readers who want to check the small cases with the least
+machine-specific setup. It is slower and, when `flag.cpp` is requested, its
+in-process deduplication sort holds the labeled flag rows in memory. It is
+therefore intended for cases such as `K(2,2)`, `K(2,3)`, and `K(3,3)`, rather
+than the largest census runs.
 
-The first three rows affect drawing generation and conversion itself. The GNU
-`sort`, GNU `time`, and C++ compiler rows affect only the optional exact
-isomorphism reduction through external `flag.cpp`. Consequently, a macOS port
-of export-only operation mainly requires spawn-safe process setup and RSS-unit
-normalization. A Windows port additionally needs a replacement for the Unix
-`resource` module.
+The export-only serial path is supported on a current ordinary installation of
+macOS, Windows, or Linux with Python 3.12 or newer. Exact flag-isomorphism
+reduction remains optional and requires external `flag.cpp` plus a compatible
+C++ compiler. The current compiler command is `g++`; on macOS the Xcode command
+line tools normally provide a compatible Clang driver under that name. On
+Windows, use a `g++` supplied by MinGW-w64 or MSYS2. Native MSVC is not currently
+supported because `compile_reducer` in `src/graph_drawings/cli.py` constructs
+GNU-style compiler arguments.
+
+`--workers N` is the Linux parallel mode used for the larger cases. Its Linux
+restriction comes from these locations:
+
+| Location | Linux-dependent behavior | Change needed for parallel macOS or Windows support |
+|---|---|---|
+| `src/graph_drawings/local_runner.py`: `run_local`, `_run_coordinator`, and `_run_worker` | Worker processes inherit the configured output and scratch roots through Linux `fork` behavior. | Pass the runtime roots into every child entry point and call `config.configure_runtime` after a `spawn`, or otherwise initialize every child explicitly. |
+| `src/graph_drawings/cli.py`: `export_all_shards` and `reduce_variant` | Parallel pools explicitly request `multiprocessing.get_context("fork")`. | Replace this with a tested `spawn` context. The export initializer must populate all worker state, and every task argument must remain pickleable. |
+| `src/graph_drawings/cli.py`: `sort_fixed_rows` | Parallel exact reduction invokes GNU `sort` with `--parallel`, `-S`, `-T`, `-o`, and `LC_ALL=C`. | Select an installed GNU `gsort` on macOS or GNU `sort` from MSYS2 on Windows, or implement a bounded-memory Python external merge sort. BSD `sort` and Windows `sort.exe` are not command-line compatible. |
+
+Process-resource measurements are isolated in
+`src/graph_drawings/resource_usage.py`: macOS byte-valued RSS measurements are
+converted to KiB, while Windows uses the timing-only fallback. GNU
+`/usr/bin/time -v` diagnostics are attempted only on Linux and are not required
+for correctness.
 
 ## Installation
 
@@ -58,6 +77,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
+On Windows PowerShell, use `.venv\Scripts\python -m pip install -e .` after
+creating the environment with `py -3.12 -m venv .venv`.
+
 Install the test dependency and run the bounded test suite with:
 
 ```bash
@@ -67,8 +89,18 @@ Install the test dependency and run the bounded test suite with:
 
 ## Run a census
 
-The following command generates the drawings of `K(2,3)` and exports both flag
-representations without reducing the flag rows by isomorphism:
+For a straightforward single-process check on macOS, Windows, or Linux:
+
+```bash
+bipartite-drawing-census 2 3 \
+  --serial \
+  --output-dir results/K2_3
+```
+
+This writes the six strong drawings of `K(2,3)` and both unreduced flag
+representations without starting a coordinator or worker process.
+
+For parallel Linux execution, replace `--serial` with a worker count:
 
 ```bash
 bipartite-drawing-census 2 3 \
@@ -76,7 +108,8 @@ bipartite-drawing-census 2 3 \
   --output-dir results/K2_3
 ```
 
-Scratch files default to `$TMPDIR/complete-bipartite-drawing-census/<run-name>`.
+Scratch files default beneath the platform temporary directory (`$TMPDIR` when
+that variable is set).
 An explicit scratch location is recommended for larger cases:
 
 ```bash
@@ -87,11 +120,11 @@ bipartite-drawing-census 3 4 \
 ```
 
 To obtain exact crossing-pair and 4-graph isomorphism-class counts, add the
-external source file:
+external source file. It can be combined with either execution mode:
 
 ```bash
 bipartite-drawing-census 2 3 \
-  --workers 4 \
+  --serial \
   --output-dir results/K2_3 \
   --flag-cpp /path/to/flag.cpp
 ```
@@ -103,7 +136,8 @@ of `flag.cpp` is recorded in the run manifest.
 Each run writes:
 
 - `run_config.json`, describing the graph and enumeration settings;
-- `coordinator.sqlite`, containing the resumable work state;
+- `coordinator.sqlite`, containing the resumable work state (serial mode keeps
+  the file format but does not start a coordinator service);
 - compact drawing shards and generation diagnostics under `outputs/`;
 - crossing-pair and 4-graph rows under `census/export-shards/`;
 - `census/run.json`, with commands, timings, hashes, and stage status;

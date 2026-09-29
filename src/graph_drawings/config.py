@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 
 PROJECT = "complete-bipartite-drawing-census"
@@ -17,7 +18,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 # Defaults keep direct module use confined to the current working directory.
 RESULTS_ROOT = Path.cwd() / "results"
 RUNS_ROOT = RESULTS_ROOT
-SCRATCH_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / PROJECT
+SCRATCH_ROOT = Path(os.environ.get("TMPDIR", tempfile.gettempdir())) / PROJECT
 SHARED_ROOT = RESULTS_ROOT
 CURRENT_RUN_FILE = RESULTS_ROOT / ".current_run_id"
 
